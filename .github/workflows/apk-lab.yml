@@ -1,0 +1,419 @@
+name: APK Live Lab
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/apk-lab.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  lab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Start secure APK upload gate
+        shell: bash
+        env:
+          TOKEN_SHA256: "9ed09157c17351a78f80883ef17a36df75fafcba5b594140b06dc71ee9e116bc"
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/apklab
+
+          python3 -m pip install --quiet flask
+
+          cat > /tmp/apklab/server.py <<'PY'
+          import os
+          import hashlib
+          from pathlib import Path
+          from flask import Flask, request, abort, render_template_string
+
+          ROOT = Path("/tmp/apklab")
+          TOKEN_SHA256 = os.environ["TOKEN_SHA256"]
+
+          app = Flask(__name__)
+          app.config["MAX_CONTENT_LENGTH"] = 700 * 1024 * 1024
+
+          PAGE = r'''
+          <!doctype html>
+          <html lang="zh-CN">
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1">
+          <title>APK Live Lab</title>
+          <style>
+          body{font-family:system-ui;background:#111;color:#eee;max-width:720px;margin:30px auto;padding:20px}
+          .box{background:#1d1d1d;padding:22px;border-radius:16px}
+          input{display:block;margin:10px 0 24px;width:100%}
+          button{padding:12px 22px;font-size:16px}
+          #status{margin-top:20px;white-space:pre-wrap}
+          </style>
+          <div class="box">
+            <h2>APK Live Lab</h2>
+            <p>两个 APK 都选好后再上传。文件只进入本次临时构建机。</p>
+            <form id="f">
+              <label>① 原始 APK</label>
+              <input type="file" name="source" accept=".apk" required>
+              <label>② Work 修改后的 APK</label>
+              <input type="file" name="modified" accept=".apk" required>
+              <button type="submit">上传并开始分析</button>
+            </form>
+            <div id="status">等待文件</div>
+          </div>
+          <script>
+          const form=document.getElementById("f");
+          const status=document.getElementById("status");
+          form.onsubmit=(e)=>{
+            e.preventDefault();
+            const token=location.hash.slice(1);
+            if(!token){status.textContent="缺少访问令牌";return;}
+            const data=new FormData(form);
+            data.append("token",token);
+            const xhr=new XMLHttpRequest();
+            xhr.open("POST","/upload");
+            xhr.upload.onprogress=(e)=>{
+              if(e.lengthComputable){
+                status.textContent="正在上传："+Math.round(e.loaded/e.total*100)+"%";
+              }
+            };
+            xhr.onload=()=>{
+              status.textContent=xhr.status===200
+                ? "上传完成，可以回到 ChatGPT 了。"
+                : "上传失败："+xhr.responseText;
+            };
+            xhr.onerror=()=>status.textContent="网络连接失败";
+            status.textContent="开始上传…";
+            xhr.send(data);
+          };
+          </script>
+          </html>
+          '''
+
+          @app.get("/")
+          def index():
+              return render_template_string(PAGE)
+
+          @app.post("/upload")
+          def upload():
+              token = request.form.get("token", "")
+              digest = hashlib.sha256(token.encode()).hexdigest()
+              if digest != TOKEN_SHA256:
+                  abort(403)
+
+              if "source" not in request.files or "modified" not in request.files:
+                  return "缺少 APK", 400
+
+              request.files["source"].save(ROOT / "source.apk")
+              request.files["modified"].save(ROOT / "modified.apk")
+
+              (ROOT / "ready").write_text("ok")
+              return "OK"
+
+          app.run(host="127.0.0.1", port=8080, threaded=True)
+          PY
+
+          nohup python3 /tmp/apklab/server.py \
+            >/tmp/apklab/server.log 2>&1 &
+
+          curl -L --fail \
+            -o /tmp/apklab/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+
+          chmod +x /tmp/apklab/cloudflared
+
+          nohup /tmp/apklab/cloudflared tunnel \
+            --no-autoupdate \
+            --url http://127.0.0.1:8080 \
+            >/tmp/apklab/tunnel.log 2>&1 &
+
+          URL=""
+          for i in $(seq 1 60); do
+            URL="$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/apklab/tunnel.log | head -n1 || true)"
+            [ -n "$URL" ] && break
+            sleep 2
+          done
+
+          if [ -z "$URL" ]; then
+            cat /tmp/apklab/tunnel.log
+            exit 1
+          fi
+
+          echo
+          echo "===== APK LIVE LAB READY ====="
+          echo "UPLOAD_BASE_URL=$URL"
+          echo "Waiting for the two APK files..."
+          echo
+
+          if ! timeout 1800 bash -c \
+            'until [ -f /tmp/apklab/ready ]; do sleep 2; done'
+          then
+            echo "Timed out waiting for APK upload."
+            exit 1
+          fi
+
+          echo "===== UPLOAD COMPLETE ====="
+
+      - name: Analyze original and modified APK
+        shell: bash
+        run: |
+          set +e
+
+          BT="$(find "$ANDROID_HOME/build-tools" \
+            -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n1)"
+
+          APKSIGNER="$BT/apksigner"
+          ZIPALIGN="$BT/zipalign"
+          AAPT2="$BT/aapt2"
+
+          REPORT=/tmp/apklab/report.txt
+
+          {
+            echo "===== APK ANALYSIS START ====="
+            date -u
+            echo "BUILD_TOOLS=$BT"
+            echo
+
+            for NAME in source modified; do
+              APK="/tmp/apklab/${NAME}.apk"
+
+              echo "===== ${NAME^^} SHA256 ====="
+              sha256sum "$APK"
+              echo
+
+              echo "===== ${NAME^^} APK SIGNATURE ====="
+              "$APKSIGNER" verify \
+                --verbose \
+                --print-certs \
+                "$APK" 2>&1 | tee "/tmp/apklab/${NAME}.sig"
+              echo
+
+              echo "===== ${NAME^^} ZIPALIGN ====="
+              "$ZIPALIGN" -c -P 16 -v 4 "$APK" 2>&1 | tail -n 8
+              echo
+
+              echo "===== ${NAME^^} MANIFEST HINTS ====="
+              "$AAPT2" dump xmltree \
+                --file AndroidManifest.xml \
+                "$APK" 2>/dev/null \
+                | grep -Ei 'package|application|StubApp|name' \
+                | head -n 100 || true
+              echo
+            done
+
+            python3 <<'PY'
+          import hashlib
+          import re
+          import zipfile
+          from pathlib import Path
+
+          root = Path("/tmp/apklab")
+          srcp = root / "source.apk"
+          modp = root / "modified.apk"
+
+          def digest_entry(z, name):
+              h = hashlib.sha256()
+              with z.open(name) as f:
+                  while True:
+                      b = f.read(1024 * 1024)
+                      if not b:
+                          break
+                      h.update(b)
+              return h.hexdigest()
+
+          def parse_cert(path):
+              text = path.read_text(errors="ignore")
+              m = re.search(
+                  r"certificate SHA-256 digest:\s*([0-9A-Fa-f:]+)",
+                  text
+              )
+              return m.group(1).replace(":", "").lower() if m else None
+
+          watched = [
+              "AndroidManifest.xml",
+              "classes.dex",
+              "assets/.jgapp",
+              "assets/libjiagu.so",
+              "assets/libjiagu_x86.so",
+              "lib/armeabi-v7a/libvar0.so",
+              "assets/json/StageSettings.json",
+              "assets/layout.xml",
+          ]
+
+          print("===== ZIP CONTENT COMPARISON =====")
+
+          with zipfile.ZipFile(srcp) as a, zipfile.ZipFile(modp) as b:
+              an = set(a.namelist())
+              bn = set(b.namelist())
+
+              changed = []
+
+              for name in sorted(an & bn):
+                  if name.upper().startswith("META-INF/"):
+                      continue
+
+                  ia = a.getinfo(name)
+                  ib = b.getinfo(name)
+
+                  if ia.file_size == ib.file_size and ia.CRC == ib.CRC:
+                      continue
+
+                  if digest_entry(a, name) != digest_entry(b, name):
+                      changed.append(name)
+
+              print("Changed non-signature entries:", len(changed))
+              for name in changed:
+                  print("CHANGED:", name)
+
+              print()
+              print("Only in source:", sorted(an - bn))
+              print("Only in modified:", sorted(bn - an))
+
+              print()
+              print("===== WATCHED ENTRY METADATA =====")
+
+              for name in watched:
+                  print()
+                  print("ENTRY:", name)
+
+                  if name in an:
+                      i = a.getinfo(name)
+                      print(
+                          " source:",
+                          "size=", i.file_size,
+                          "crc=", hex(i.CRC),
+                          "method=", i.compress_type,
+                          "offset=", i.header_offset,
+                          "sha256=", digest_entry(a, name),
+                      )
+                  else:
+                      print(" source: MISSING")
+
+                  if name in bn:
+                      i = b.getinfo(name)
+                      print(
+                          " modified:",
+                          "size=", i.file_size,
+                          "crc=", hex(i.CRC),
+                          "method=", i.compress_type,
+                          "offset=", i.header_offset,
+                          "sha256=", digest_entry(b, name),
+                      )
+                  else:
+                      print(" modified: MISSING")
+
+              print()
+              print("===== 360 SHELL CONTENT EQUALITY =====")
+
+              for name in [
+                  "assets/.jgapp",
+                  "assets/libjiagu.so",
+                  "assets/libjiagu_x86.so",
+              ]:
+                  if name in an and name in bn:
+                      same = digest_entry(a, name) == digest_entry(b, name)
+                      print(name, "SAME" if same else "DIFFERENT")
+
+              source_cert = parse_cert(root / "source.sig")
+
+              print()
+              print("SOURCE_CERT_SHA256:", source_cert)
+
+              if source_cert:
+                  raw = bytes.fromhex(source_cert)
+                  forms = [
+                      ("cert_raw", raw),
+                      ("cert_hex_lower", source_cert.encode()),
+                      ("cert_hex_upper", source_cert.upper().encode()),
+                  ]
+              else:
+                  forms = []
+
+              needles = [
+                  b"ZXMR.keystore",
+                  b"CN=ZXMR.keystore",
+                  b"com.stub.StubApp",
+                  b"StubApp",
+                  b"signature",
+                  b"Signature",
+                  b"SHA1",
+                  b"SHA256",
+                  b"MD5",
+              ]
+
+              print()
+              print("===== SHELL / SIGNATURE MARKER SCAN =====")
+
+              for label, z in [("source", a), ("modified", b)]:
+                  for info in z.infolist():
+                      name = info.filename
+                      low = name.lower()
+
+                      if not (
+                          name == "classes.dex"
+                          or name == "assets/.jgapp"
+                          or "jiagu" in low
+                          or low.endswith(".so")
+                      ):
+                          continue
+
+                      if info.file_size > 100 * 1024 * 1024:
+                          continue
+
+                      try:
+                          data = z.read(name)
+                      except Exception:
+                          continue
+
+                      for marker_name, marker in forms:
+                          pos = data.find(marker)
+                          if pos >= 0:
+                              print(
+                                  label,
+                                  name,
+                                  marker_name,
+                                  "OFFSET",
+                                  pos
+                              )
+
+                      for marker in needles:
+                          pos = data.find(marker)
+                          if pos >= 0:
+                              print(
+                                  label,
+                                  name,
+                                  repr(marker),
+                                  "OFFSET",
+                                  pos
+                              )
+
+              print()
+              print("===== JIAGU-RELATED ENTRIES =====")
+
+              for name in sorted(an | bn):
+                  low = name.lower()
+                  if (
+                      "jiagu" in low
+                      or "stub" in low
+                      or "var0" in low
+                      or ".jgapp" in low
+                  ):
+                      print(name)
+
+          print("===== PYTHON ANALYSIS END =====")
+          PY
+
+            echo
+            echo "===== APK ANALYSIS END ====="
+          } | tee "$REPORT"
+
+      - name: Upload analysis report only
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-analysis-report
+          path: |
+            /tmp/apklab/report.txt
+            /tmp/apklab/source.sig
+            /tmp/apklab/modified.sig
+          retention-days: 1
