@@ -1,0 +1,76 @@
+name: APK Probe
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/apk-probe.yml"
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Run environment probe
+        shell: bash
+        run: |
+          set +e
+
+          {
+            echo "===== APK PROBE START ====="
+            date -u
+            echo
+
+            echo "===== SYSTEM ====="
+            uname -a
+            id
+            echo
+
+            echo "===== JAVA ====="
+            java -version
+            javac -version
+            echo
+
+            echo "===== PYTHON ====="
+            python3 --version
+            echo
+
+            echo "===== ANDROID SDK ====="
+            echo "ANDROID_HOME=$ANDROID_HOME"
+            echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+            echo
+
+            echo "===== APK TOOLS ====="
+            command -v apksigner || true
+            command -v zipalign || true
+
+            find "${ANDROID_HOME:-/usr/local/lib/android/sdk}/build-tools" \
+              -maxdepth 2 \
+              -type f \
+              \( -name apksigner -o -name zipalign \) \
+              -print 2>/dev/null || true
+
+            echo
+            echo "===== ZIP TOOLS ====="
+            command -v zip || true
+            command -v unzip || true
+            zip -v | head -n 3 || true
+            unzip -v | head -n 3 || true
+
+            echo
+            echo "===== DISK ====="
+            df -h
+
+            echo
+            echo "===== MEMORY ====="
+            free -h
+
+            echo
+            echo "===== APK PROBE END ====="
+          } | tee probe.txt
+
+      - name: Upload probe report
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-probe-report
+          path: probe.txt
